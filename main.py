@@ -1,4 +1,4 @@
-def process_users(user_list=[]):
+def processUsers(user_list=[]):
     total = 0
     for i in range(len(user_list)):
         try:
@@ -12,7 +12,7 @@ def process_users(user_list=[]):
     return total
 
 
-def write_log(log_msg, file_name="log.txt"):
+def WriteLog(log_msg, file_name="log.txt"):
     f = open(file_name, "a")
     f.write(log_msg + "\n")
     f.close()
@@ -24,11 +24,11 @@ def main():
         {'name': 'Bob', 'active': False},
         {'name': 'Charlie', 'active': True}
     ]
-    count = process_users(users)
+    count = procesUsers(users)
 
     message = "Processed " + str(count) + " users."
 
-    write_log("Log: " + "Processed " + str(count) + "users")
+    WriteLog("Log: " + "Processed " + str(count) + " users.")
     return count
 
 
