@@ -24,7 +24,7 @@ def main():
         {'name': 'Bob', 'active': False},
         {'name': 'Charlie', 'active': True}
     ]
-    count = procesUsers(users)
+    count = processUsers(users)
 
     message = "Processed " + str(count) + " users."
 
