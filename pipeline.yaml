@@ -1,0 +1,227 @@
+name: Build-Test-Push-Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - uat
+      - dev
+  pull_request:
+    branches:
+      - main
+      - uat
+      - dev
+
+
+env:
+  AWS_REGION: eu-north-1
+  IMAGE_NAME: 565546564004.dkr.ecr.eu-north-1.amazonaws.com/denuncia/backend
+
+jobs:
+  determine-env:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+
+    steps:
+      - name: Set environment variables for branch
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            TARGET_BRANCH="${{ github.base_ref }}"
+          else
+            TARGET_BRANCH="${{ github.ref_name }}"
+          fi
+          
+          if [ "${TARGET_BRANCH}" == "main" ]; then
+            echo "::set-output name=environment::prod"
+          elif [ "${TARGET_BRANCH}" == "uat" ]; then
+            echo "::set-output name=environment::uat"
+          else
+            echo "::set-output name=environment::dev"
+          fi
+
+  build:
+    needs: determine-env
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set ENV variable
+        run: echo "ENV=${{ needs.determine-env.outputs.environment }}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build Docker image and upload to ECR as temp
+        run: |
+          export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token \
+            --domain modules \
+            --domain-owner 565546564004 \
+            --query authorizationToken \
+            --output text)
+          docker build \
+            --build-arg CODEARTIFACT_AUTH_TOKEN=$CODEARTIFACT_AUTH_TOKEN \
+            -t $IMAGE_NAME:$ENV-test-$GITHUB_SHA \
+            backend/.
+          docker push $IMAGE_NAME:$ENV-test-$GITHUB_SHA
+
+  lint:
+    needs: [ build, determine-env ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set ENV variable
+        run: echo "ENV=${{ needs.determine-env.outputs.environment }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Download temp Docker image and run linter
+        run: |
+          docker pull $IMAGE_NAME:$ENV-test-$GITHUB_SHA
+          docker run --rm $IMAGE_NAME:$ENV-test-$GITHUB_SHA \
+            /app/.venv/bin/pylint --load-plugins pylint_pydantic src        
+
+  test:
+    needs: [ build, determine-env ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set ENV variable
+        run: echo "ENV=${{ needs.determine-env.outputs.environment }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Download temp Docker image and run tests
+        run: |
+          docker pull $IMAGE_NAME:$ENV-test-$GITHUB_SHA
+          docker run --rm -e PYTHONPATH=/app $IMAGE_NAME:$ENV-test-$GITHUB_SHA \
+            /app/.venv/bin/pytest tests --ignore=tests/test_integration.py
+
+  push:
+    needs: [ lint, test, determine-env ]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set ENV variable
+        run: echo "ENV=${{ needs.determine-env.outputs.environment }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Re-tag Docker image to final tags
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name denuncia/backend \
+            --image-ids imageTag=$ENV-test-$GITHUB_SHA \
+            --query 'images[0].imageManifest' \
+            --output text)       
+          aws ecr put-image \
+            --repository-name denuncia/backend \
+            --image-tag $ENV-$GITHUB_SHA \
+            --image-manifest "$MANIFEST"
+          aws ecr put-image \
+            --repository-name denuncia/backend \
+            --image-tag $ENV-latest \
+            --image-manifest "$MANIFEST"
+          
+
+  deploy:
+    needs: [ push, determine-env ]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set ENV variable
+        run: echo "ENV=${{ needs.determine-env.outputs.environment }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ env.AWS_REGION }}
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ENV-cluster \
+            --service denuncia-$ENV-service \
+            --force-new-deployment
+
+      - name: Monitor deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ENV-cluster \
+            --services denuncia-$ENV-service
+
+  integration-tests:
+      needs: [deploy, determine-env ]
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
+        
+        - name: Install minimal dependencies for integration tests
+          run: |
+            pip install pytest python-dotenv requests pytest-cov
+  
+        - name: Set dynamic DENUNCIA_URL based on environment
+          run: |
+            if [ "${{ needs.determine-env.outputs.environment }}" = "dev" ]; then
+              echo "DENUNCIA_URL=https://dev.api.denuncia.ai/v1" >> $GITHUB_ENV
+            elif [ "${{ needs.determine-env.outputs.environment }}" = "uat" ]; then
+              echo "DENUNCIA_URL=https://uat.api.denuncia.ai/v1" >> $GITHUB_ENV
+            elif [ "${{ needs.determine-env.outputs.environment }}" = "prod" ]; then
+              echo "DENUNCIA_URL=https://api.denuncia.ai/" >> $GITHUB_ENV
+            fi
+        
+        - name: Set superuser credentials
+          run: |
+            echo "SUPERUSER_EMAIL=${{ secrets.SUPERUSER_EMAIL }}" >> $GITHUB_ENV
+            echo "SUPERUSER_PASSWORD=${{ secrets.SUPERUSER_PASSWORD }}" >> $GITHUB_ENV
+
+        - name: Run integration tests
+          run: pytest backend/tests/test_integration.py --noconftest
